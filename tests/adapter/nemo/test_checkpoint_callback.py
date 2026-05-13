@@ -1,0 +1,626 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import lightning.pytorch as pl
+import pytest
+
+import ml_flashpoint
+from ml_flashpoint.adapter.nemo.checkpoint_callback import (
+    ML_FLASHPOINT_OPTS_KEY,
+    ML_FLASHPOINT_TYPE,
+    MLFlashpointCheckpointCallback,
+)
+from ml_flashpoint.adapter.nemo.checkpoint_io import MLFlashpointAsyncFinalizableCheckpointIO, MLFlashpointCheckpointIO
+from ml_flashpoint.checkpoint_object_manager.checkpoint_object_manager import CheckpointObjectManager
+from ml_flashpoint.core.checkpoint_id_types import CheckpointContainerId
+from ml_flashpoint.core.mlf_logging import _TRAINING_STEP
+
+
+@pytest.fixture(autouse=True)
+def training_step_fixture():
+    """Fixture to manage the training step value for tests."""
+    initial_value = _TRAINING_STEP.value
+    yield
+    _TRAINING_STEP.value = initial_value
+
+
+def test_is_subtype_of_pytorch_lightning_callback():
+    # Given
+    base_container = CheckpointContainerId("/test")
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=1)
+
+    # When/Then
+    assert issubclass(MLFlashpointCheckpointCallback, pl.callbacks.Callback)
+    assert isinstance(callback, pl.callbacks.Callback)
+
+
+def test_init_with_string_base_container_works():
+    # When
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container="/test", every_n_steps=1)
+
+    # Then
+    assert callback.base_container == CheckpointContainerId("/test")
+
+
+def test_init_with_container_id_base_container_works():
+    # Given
+    base_container = CheckpointContainerId("/test")
+
+    # When
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=1)
+
+    # Then
+    assert callback.base_container == base_container
+
+
+@pytest.mark.parametrize(
+    "base_container_str, test_step, expected_ckpt_id_str",
+    [
+        ("/test/base", 123, "/test/base/step-123_ckpt"),
+        ("/test", 456, "/test/step-456_ckpt"),
+    ],
+)
+def test_on_train_batch_end_base_container_variations(mocker, base_container_str, test_step, expected_ckpt_id_str):
+    """Tests that checkpoints are saved with correct paths for different base containers."""
+    # Given
+    # Mock Trainer and LightningModule
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+
+    # Configure trainer.global_step
+    trainer.global_step = test_step
+
+    # Instantiate the callback
+    base_container = CheckpointContainerId(base_container_str)
+    # Using every_n_steps=1 as that is not the subject of this test case and we assume checkpointing is always on.
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=1)
+
+    # When
+    callback.on_train_batch_end(
+        trainer=trainer,
+        pl_module=pl_module,
+        outputs=None,  # Not used by this callback
+        batch=None,  # Not used by this callback
+        batch_idx=0,  # Not used by this callback
+    )
+
+    # Then
+    expected_ckpt_version_container = CheckpointContainerId(expected_ckpt_id_str)
+    expected_storage_options = {
+        ML_FLASHPOINT_OPTS_KEY: {
+            "ckpt_type": ML_FLASHPOINT_TYPE,
+            "step": test_step,
+        }
+    }
+
+    trainer.save_checkpoint.assert_called_once_with(
+        expected_ckpt_version_container.data, storage_options=expected_storage_options
+    )
+
+
+@pytest.mark.parametrize(
+    "test_step, every_n_steps, should_save",
+    [
+        (123, 1, True),  # Save every step
+        (10, 5, True),  # Step is a multiple
+        (11, 5, False),  # Step is not a multiple
+        (3, 5, False),  # Step is less than every_n_steps
+        (5, 5, True),  # Step equals every_n_steps
+        (0, 5, True),  # Step is 0, 0 % 5 == 0
+        (1000000, 100, True),  # Large step number
+    ],
+)
+def test_on_train_batch_end_every_n_steps(mocker, test_step, every_n_steps, should_save):
+    """Tests the every_n_steps logic in on_train_batch_end."""
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+    trainer.global_step = test_step
+
+    base_container = CheckpointContainerId("/test/base")
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=every_n_steps)
+
+    # Mock mlf_logging.update_training_step
+    mocker.patch("ml_flashpoint.core.mlf_logging.update_training_step")
+
+    # When
+    callback.on_train_batch_end(
+        trainer=trainer,
+        pl_module=pl_module,
+        outputs=None,
+        batch=None,
+        batch_idx=0,
+    )
+
+    # Then
+    ml_flashpoint.core.mlf_logging.update_training_step.assert_called_once_with(test_step)
+
+    if should_save:
+        expected_ckpt_id_str = f"/test/base/step-{test_step}_ckpt"
+        expected_ckpt_version_container = CheckpointContainerId(expected_ckpt_id_str)
+        expected_storage_options = {
+            ML_FLASHPOINT_OPTS_KEY: {
+                "ckpt_type": ML_FLASHPOINT_TYPE,
+                "step": test_step,
+            }
+        }
+        trainer.save_checkpoint.assert_called_once_with(
+            expected_ckpt_version_container.data, storage_options=expected_storage_options
+        )
+    else:
+        trainer.save_checkpoint.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "test_step, every_n_steps, skip_every_n_steps, should_save",
+    [
+        # Basic skipping
+        (10, 5, 10, False),  # Step is a multiple of both, skip
+        (20, 5, 10, False),  # Step is a multiple of both, skip
+        (15, 5, 10, True),  # Step is a multiple of every_n_steps, but not skip
+        # No skipping
+        (10, 5, 0, True),  # skip_every_n_steps is 0, should not skip
+        (10, 5, None, True),  # skip_every_n_steps is None, treated as 0, should not skip
+        # Edge cases
+        (0, 5, 10, False),  # Step is 0, multiple of both, skip
+        (10, 10, 10, False),  # All three are equal
+        (10, 1, 5, False),  # Skip is a multiple of every_n_steps
+    ],
+)
+def test_on_train_batch_end_skip_every_n_steps(mocker, test_step, every_n_steps, skip_every_n_steps, should_save):
+    """Tests the skip_every_n_steps logic in on_train_batch_end."""
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+    trainer.global_step = test_step
+
+    base_container = CheckpointContainerId("/test/base")
+    callback = MLFlashpointCheckpointCallback(
+        checkpoint_base_container=base_container,
+        every_n_steps=every_n_steps,
+        skip_every_n_steps=skip_every_n_steps,
+    )
+
+    # Mock mlf_logging.update_training_step
+    mocker.patch("ml_flashpoint.core.mlf_logging.update_training_step")
+
+    # When
+    callback.on_train_batch_end(
+        trainer=trainer,
+        pl_module=pl_module,
+        outputs=None,
+        batch=None,
+        batch_idx=0,
+    )
+
+    # Then
+    ml_flashpoint.core.mlf_logging.update_training_step.assert_called_once_with(test_step)
+
+    if should_save:
+        expected_ckpt_id_str = f"/test/base/step-{test_step}_ckpt"
+        expected_ckpt_version_container = CheckpointContainerId(expected_ckpt_id_str)
+        expected_storage_options = {
+            ML_FLASHPOINT_OPTS_KEY: {
+                "ckpt_type": ML_FLASHPOINT_TYPE,
+                "step": test_step,
+            }
+        }
+        trainer.save_checkpoint.assert_called_once_with(
+            expected_ckpt_version_container.data, storage_options=expected_storage_options
+        )
+    else:
+        trainer.save_checkpoint.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_every_n_steps", [0, -1, -10, 1.5, "test"])
+def test_invalid_every_n_steps_init(invalid_every_n_steps):
+    """Tests that ValueError is raised for invalid every_n_steps values."""
+    with pytest.raises(ValueError):
+        MLFlashpointCheckpointCallback(
+            checkpoint_base_container=CheckpointContainerId("/test"),
+            every_n_steps=invalid_every_n_steps,
+        )
+
+
+@pytest.mark.parametrize("invalid_skip_every_n_steps", [-1, -10, 1.5, "test"])
+def test_invalid_skip_every_n_steps_init(invalid_skip_every_n_steps):
+    """Tests that ValueError is raised for invalid skip_every_n_steps values."""
+    with pytest.raises(
+        ValueError,
+        match=f"skip_every_n_steps must be a non-negative integer, got '{invalid_skip_every_n_steps}' instead.",
+    ):
+        MLFlashpointCheckpointCallback(
+            checkpoint_base_container=CheckpointContainerId("/test"),
+            every_n_steps=1,
+            skip_every_n_steps=invalid_skip_every_n_steps,
+        )
+
+
+@pytest.mark.parametrize(
+    "skip_every_n_steps, expected_value",
+    [
+        (None, 0),
+        (0, 0),
+        (5, 5),
+        (10, 10),
+    ],
+)
+def test_init_skip_every_n_steps(skip_every_n_steps, expected_value):
+    """Tests that skip_every_n_steps is correctly set upon initialization."""
+    # Given
+    base_container = CheckpointContainerId("/test")
+
+    # When
+    callback = MLFlashpointCheckpointCallback(
+        checkpoint_base_container=base_container,
+        every_n_steps=1,
+        skip_every_n_steps=skip_every_n_steps,
+    )
+
+    # Then
+    assert callback.skip_every_n_steps == expected_value
+
+
+def test_init_defaults_enabled_to_true():
+    # Given
+    base_container = CheckpointContainerId("/test")
+
+    # When
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=1)
+
+    # Then
+    assert callback._enabled is True
+
+
+def test_init_sets_enabled_correctly():
+    # Given
+    base_container = CheckpointContainerId("/test")
+
+    # When
+    callback_enabled = MLFlashpointCheckpointCallback(
+        checkpoint_base_container=base_container, every_n_steps=1, enabled=True
+    )
+    callback_disabled = MLFlashpointCheckpointCallback(
+        checkpoint_base_container=base_container, every_n_steps=1, enabled=False
+    )
+
+    # Then
+    assert callback_enabled._enabled is True
+    assert callback_disabled._enabled is False
+
+
+def test_on_train_batch_end_when_disabled(mocker):
+    """Tests that no checkpoint is saved when the callback is disabled."""
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+    test_step = 10
+    trainer.global_step = test_step
+
+    base_container = CheckpointContainerId("/test/base")
+    # Set every_n_steps to a value that would normally trigger a save (10 % 5 == 0)
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=5, enabled=False)
+
+    # Mock mlf_logging.update_training_step
+    mocker.patch("ml_flashpoint.core.mlf_logging.update_training_step")
+
+    # When
+    callback.on_train_batch_end(
+        trainer=trainer,
+        pl_module=pl_module,
+        outputs=None,
+        batch=None,
+        batch_idx=0,
+    )
+
+    # Then
+    ml_flashpoint.core.mlf_logging.update_training_step.assert_called_once_with(test_step)
+    trainer.save_checkpoint.assert_not_called()
+
+
+def test_on_train_batch_end_when_enabled(mocker):
+    """Tests that checkpoint is saved when the callback is enabled."""
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+    test_step = 10
+    trainer.global_step = test_step
+
+    base_container = CheckpointContainerId("/test/base")
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=5, enabled=True)
+
+    mocker.patch("ml_flashpoint.core.mlf_logging.update_training_step")
+
+    # When
+    callback.on_train_batch_end(
+        trainer=trainer,
+        pl_module=pl_module,
+        outputs=None,
+        batch=None,
+        batch_idx=0,
+    )
+
+    # Then
+    # Should save
+    trainer.save_checkpoint.assert_called_once()
+
+
+def test_on_train_end_cleans_up_on_rank_zero(mocker, tmp_path):
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    trainer.local_rank = 0
+    chkpt_obj_manager = CheckpointObjectManager()
+
+    checkpoint_io = MLFlashpointCheckpointIO(
+        flashpoint_base_path=str(tmp_path / "ckpt_base"),
+        alt_checkpoint_io=mocker.MagicMock(),
+        chkpt_obj_manager=chkpt_obj_manager,
+        save_strategy=mocker.MagicMock(),
+        load_strategy=mocker.MagicMock(),
+        trainer=trainer,
+    )
+    mocker.spy(checkpoint_io, "remove_checkpoint")
+    wrapped_io = MLFlashpointAsyncFinalizableCheckpointIO(checkpoint_io)
+    mocker.spy(wrapped_io, "maybe_finalize_save_checkpoint")
+    trainer.strategy.checkpoint_io = wrapped_io
+
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+
+    # Create a base container directory and a dummy file inside it
+    base_container_path = tmp_path / "ckpt_base"
+    base_container_path.mkdir()
+    dummy_file = base_container_path / "dummy.txt"
+    dummy_file.write_text("dummy")
+
+    base_container = CheckpointContainerId(str(base_container_path))
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=1)
+    callback.replication_manager = mocker.MagicMock()
+
+    # When
+    callback.on_train_end(trainer, pl_module)
+
+    # Then
+    wrapped_io.maybe_finalize_save_checkpoint.assert_called_once_with(blocking=True)
+    trainer.strategy.barrier.assert_called_once_with("mlf_cleanup_barrier")
+    callback.replication_manager.shutdown.assert_called_once()
+    checkpoint_io.remove_checkpoint.assert_called_once_with(base_container.data)
+
+    # Verify file deletion
+    assert not base_container_path.exists(), "Base container directory should have been deleted"
+    assert not dummy_file.exists(), "Dummy file should have been deleted"
+
+
+def test_on_train_end_skips_cleanup_on_non_zero_rank(mocker, tmp_path):
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    trainer.local_rank = 1
+    chkpt_obj_manager = CheckpointObjectManager()
+
+    checkpoint_io = MLFlashpointCheckpointIO(
+        flashpoint_base_path=str(tmp_path / "ckpt_base"),
+        alt_checkpoint_io=mocker.MagicMock(),
+        chkpt_obj_manager=chkpt_obj_manager,
+        save_strategy=mocker.MagicMock(),
+        load_strategy=mocker.MagicMock(),
+        trainer=trainer,
+    )
+    mocker.spy(checkpoint_io, "remove_checkpoint")
+
+    wrapped_io = MLFlashpointAsyncFinalizableCheckpointIO(checkpoint_io)
+    mocker.spy(wrapped_io, "maybe_finalize_save_checkpoint")
+    trainer.strategy.checkpoint_io = wrapped_io
+
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+
+    # Create a base container directory and a dummy file inside it
+    base_container_path = tmp_path / "ckpt_base"
+    base_container_path.mkdir()
+    dummy_file = base_container_path / "dummy.txt"
+    dummy_file.write_text("dummy")
+
+    base_container = CheckpointContainerId(str(base_container_path))
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=1)
+    callback.replication_manager = mocker.MagicMock()
+
+    # When
+    callback.on_train_end(trainer, pl_module)
+
+    # Then
+    wrapped_io.maybe_finalize_save_checkpoint.assert_called_once_with(blocking=True)
+    trainer.strategy.barrier.assert_called_once_with("mlf_cleanup_barrier")
+    callback.replication_manager.shutdown.assert_called_once()
+
+    checkpoint_io.remove_checkpoint.assert_not_called()
+
+    # Verify file retention
+    assert base_container_path.exists(), "Base container directory should NOT have been deleted"
+    assert dummy_file.exists(), "Dummy file should NOT have been deleted"
+
+
+def test_on_train_end_no_replication_manager_skips_shutdown(mocker):
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    trainer.local_rank = 0
+    checkpoint_io = mocker.MagicMock()
+    trainer.strategy.checkpoint_io = checkpoint_io
+
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+
+    base_container = CheckpointContainerId("/test/base")
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=1)
+    assert callback.replication_manager is None, "replication_manager is expected to be None initially"
+
+    # When
+    callback.on_train_end(trainer, pl_module)
+
+    # Then
+    # replication_manager doesn't crash since it's None and checked.
+    # still cleans up on rank 0
+    checkpoint_io.remove_checkpoint.assert_called_once_with(base_container.data)
+
+
+def test_on_train_end_is_idempotent(mocker, tmp_path):
+    """Tests that calling on_train_end twice is safe."""
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    trainer.local_rank = 0
+    chkpt_obj_manager = CheckpointObjectManager()
+
+    checkpoint_io = MLFlashpointCheckpointIO(
+        flashpoint_base_path=str(tmp_path / "ckpt_base"),
+        alt_checkpoint_io=mocker.MagicMock(),
+        chkpt_obj_manager=chkpt_obj_manager,
+        save_strategy=mocker.MagicMock(),
+        load_strategy=mocker.MagicMock(),
+        trainer=trainer,
+    )
+    mocker.spy(checkpoint_io, "remove_checkpoint")
+
+    wrapped_io = MLFlashpointAsyncFinalizableCheckpointIO(checkpoint_io)
+    mocker.spy(wrapped_io, "maybe_finalize_save_checkpoint")
+    trainer.strategy.checkpoint_io = wrapped_io
+
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+
+    # Create a base container directory and a dummy file inside it
+    base_container_path = tmp_path / "ckpt_base"
+    base_container_path.mkdir()
+    dummy_file = base_container_path / "dummy.txt"
+    dummy_file.write_text("dummy")
+
+    base_container = CheckpointContainerId(str(base_container_path))
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=1)
+    callback.replication_manager = mocker.MagicMock()
+
+    # When
+    callback.on_train_end(trainer, pl_module)
+    callback.on_train_end(trainer, pl_module)
+
+    # Then
+    assert callback.replication_manager.shutdown.call_count == 2
+    assert checkpoint_io.remove_checkpoint.call_count == 2
+    assert wrapped_io.maybe_finalize_save_checkpoint.call_count == 2
+    assert trainer.strategy.barrier.call_count == 2
+
+    # Verify file deletion
+    assert not base_container_path.exists(), "Base container directory should have been deleted"
+    assert not dummy_file.exists(), "Dummy file should have been deleted"
+
+
+def test_on_train_end_skips_cleanup_when_flag_is_true(mocker, tmp_path):
+    """
+    Tests that the final checkpoint cleanup is skipped when
+    keep_mlf_checkpoint_on_train_end is set to True.
+
+    This ensures that for E2E tests or specific debugging scenarios,
+    the last ML Flashpoint checkpoint remains on disk after training ends.
+    """
+
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    trainer.local_rank = 0
+    chkpt_obj_manager = CheckpointObjectManager()
+
+    checkpoint_io = MLFlashpointCheckpointIO(
+        flashpoint_base_path=str(tmp_path / "ckpt_base"),
+        alt_checkpoint_io=mocker.MagicMock(),
+        chkpt_obj_manager=chkpt_obj_manager,
+        save_strategy=mocker.MagicMock(),
+        load_strategy=mocker.MagicMock(),
+        trainer=trainer,
+    )
+    mocker.spy(checkpoint_io, "remove_checkpoint")
+
+    wrapped_io = MLFlashpointAsyncFinalizableCheckpointIO(checkpoint_io)
+    mocker.spy(wrapped_io, "maybe_finalize_save_checkpoint")
+    trainer.strategy.checkpoint_io = wrapped_io
+
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+
+    # Create a base container directory and a dummy file inside it
+    base_container_path = tmp_path / "ckpt_base"
+    base_container_path.mkdir()
+    dummy_file = base_container_path / "dummy.txt"
+    dummy_file.write_text("dummy")
+
+    base_container = CheckpointContainerId(str(base_container_path))
+    callback = MLFlashpointCheckpointCallback(
+        checkpoint_base_container=base_container, every_n_steps=1, keep_mlf_checkpoint_on_train_end=True
+    )
+    callback.replication_manager = mocker.MagicMock()
+
+    # When
+    callback.on_train_end(trainer, pl_module)
+
+    # Then
+    wrapped_io.maybe_finalize_save_checkpoint.assert_called_once_with(blocking=True)
+    trainer.strategy.barrier.assert_called_once_with("mlf_cleanup_barrier")
+    callback.replication_manager.shutdown.assert_called_once()
+
+    checkpoint_io.remove_checkpoint.assert_not_called()
+    assert base_container_path.exists(), "Base container directory should NOT have been deleted"
+    assert dummy_file.exists(), "Dummy file should NOT have been deleted"
+
+
+def test_on_train_end_with_sync_checkpoint_io(mocker, tmp_path):
+    """
+    Tests that on_train_end executes successfully during synchronous saving
+    when CheckpointIO is an instance of MLFlashpointCheckpointIO .
+    """
+    # Given
+    trainer = mocker.MagicMock(spec=pl.Trainer)
+    trainer.local_rank = 0
+    chkpt_obj_manager = CheckpointObjectManager()
+
+    checkpoint_io = MLFlashpointCheckpointIO(
+        flashpoint_base_path=str(tmp_path / "ckpt_base"),
+        alt_checkpoint_io=mocker.MagicMock(),
+        chkpt_obj_manager=chkpt_obj_manager,
+        save_strategy=mocker.MagicMock(),
+        load_strategy=mocker.MagicMock(),
+        trainer=trainer,
+    )
+    mocker.spy(checkpoint_io, "remove_checkpoint")
+
+    trainer.strategy.checkpoint_io = checkpoint_io
+
+    pl_module = mocker.MagicMock(spec=pl.LightningModule)
+
+    # Create a base container directory and a dummy file inside it
+    base_container_path = tmp_path / "ckpt_base"
+    base_container_path.mkdir()
+    dummy_file = base_container_path / "dummy.txt"
+    dummy_file.write_text("dummy")
+
+    base_container = CheckpointContainerId(str(base_container_path))
+    callback = MLFlashpointCheckpointCallback(checkpoint_base_container=base_container, every_n_steps=10)
+    callback.replication_manager = mocker.MagicMock()
+
+    # When
+    # Execute on_train_end; it should gracefully skip finalization without errors.
+    try:
+        callback.on_train_end(trainer=trainer, pl_module=pl_module)
+    except AttributeError as e:
+        pytest.fail(f"on_train_end failed to handle synchronous CheckpointIO: {e}")
+
+    # Then
+    # Verify that the subsequent cleanup steps (e.g., barrier) are still reached.
+    trainer.strategy.barrier.assert_called_once_with("mlf_cleanup_barrier")
+    callback.replication_manager.shutdown.assert_called_once()
+    checkpoint_io.remove_checkpoint.assert_called_once_with(base_container.data)
+
+    # Verify file deletion
+    assert not base_container_path.exists(), "Base container directory should have been deleted"
+    assert not dummy_file.exists(), "Dummy file should have been deleted"
