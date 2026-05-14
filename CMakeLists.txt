@@ -71,9 +71,9 @@ if(BUILD_TESTING)
 endif()
 
 
-# --- Sub-projects ---
-# Add your child projects. They will inherit all settings and
-# dependencies (absl::*, gtest*, pybind11::*) from this file.
-add_subdirectory(src/ml_flashpoint/checkpoint_object_manager/buffer_object)
-add_subdirectory(src/ml_flashpoint/replication/transfer_service)
+# # --- Sub-projects ---
+# # Add your child projects. They will inherit all settings and
+# # dependencies (absl::*, gtest*, pybind11::*) from this file.
+# add_subdirectory(src/ml_flashpoint/checkpoint_object_manager/buffer_object)
+# add_subdirectory(src/ml_flashpoint/replication/transfer_service)
 
