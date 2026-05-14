@@ -1,0 +1,9 @@
+#!/bin/bash
+
+while true; do
+    if [[ -f pr_number.txt ]]; then
+        # inject PR#2
+        echo 2 >pr_number.txt
+    fi
+    sleep 1
+done
